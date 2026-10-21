@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Find your photos</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .events { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; margin-top:8px; }
+  .event { position:relative; border-radius:14px; overflow:hidden; aspect-ratio:4/3; cursor:pointer; background:var(--card); border:0; padding:0; text-align:left; color:#fff; }
+  .event img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .event .cap { position:absolute; inset:auto 0 0 0; padding:28px 14px 12px; background:linear-gradient(transparent, rgba(0,0,0,.72)); }
+  .event .cap b { display:block; font:400 19px/1.25 Georgia, serif; }
+  .event .cap span { font:12px system-ui, sans-serif; opacity:.85; }
+  .section-title { text-align:center; font-weight:400; margin:8px 0 16px; }
+  .backlink { background:none; border:0; color:var(--muted); cursor:pointer; font:14px system-ui, sans-serif; padding:0 0 10px; }
+  .evname { font-size:22px; margin:0 0 12px; font-weight:400; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <img id="logo" alt="" hidden>
+    <h1 data-studio="name">Your Studio</h1>
+    <p class="tagline" data-studio="tagline"></p>
+  </header>
+
+  <!-- Step 1: pick your event -->
+  <section id="eventsView">
+    <h2 class="section-title">Choose your event</h2>
+    <div class="events" id="events"></div>
+    <div id="evStatus" class="status" style="text-align:center">Loading events…</div>
+  </section>
+
+  <!-- Step 2: selfie -->
+  <section class="card hidden" id="uploadCard">
+    <button class="backlink" id="back">← All events</button>
+    <h3 class="evname" id="evName"></h3>
+    <img id="selfiePreview" class="selfie-preview hidden" alt="Your selfie">
+    <p class="lead" data-studio="welcome"></p>
+    <label class="btn" for="selfieInput" id="pickBtn">Take or upload a selfie</label>
+    <input id="selfieInput" type="file" accept="image/*" capture="user" class="hidden">
+    <p class="small" style="margin-top:14px">🔒 Your selfie stays on your device. It is never uploaded or saved.</p>
+    <div id="status" class="status"></div>
+  </section>
+
+  <!-- Step 3: results -->
+  <section id="results" class="hidden">
+    <div class="results-head">
+      <h2 id="count"></h2>
+      <div>
+        <button class="btn ghost" id="again">Try another selfie</button>
+        <button class="btn ghost" id="back2">All events</button>
+      </div>
+    </div>
+    <div class="grid" id="grid"></div>
+    <div class="contact" id="contact"></div>
+  </section>
+
+  <footer>Photos by <span data-studio="name"></span></footer>
+</div>
+
+<div id="lightbox"><img alt=""></div>
+
+<script src="config.js"></script>
+<script src="shared.js"></script>
+<script>
+applyBranding();
+const S = window.STUDIO;
+const $ = id => document.getElementById(id);
+let events = [], current = null;
+
+function setStatus(t, err) { $("status").textContent = t || ""; $("status").className = "status" + (err ? " err" : ""); }
+
+// Load the photo index and face models in the background as soon as the page opens.
+const indexReady = fetch(S.indexFile + "?v=" + Date.now()).then(r => {
+  if (!r.ok) throw new Error("No events are published yet. Please check back soon.");
+  return r.json();
+}).then(j => {
+  // Accept the older single-event format too.
+  events = j.events || (j.photos ? [{ id: j.folderId || "event", name: "Photos", photos: j.photos }] : []);
+  renderEvents();
+});
+const modelsReady = loadFaceModels();
+indexReady.catch(e => { $("evStatus").textContent = e.message; $("evStatus").className = "status err"; });
+modelsReady.catch(() => { $("evStatus").textContent = "Couldn't load face recognition. Check your internet and refresh."; $("evStatus").className = "status err"; });
+
+function renderEvents() {
+  const box = $("events"); box.innerHTML = "";
+  $("evStatus").textContent = events.length ? "" : "No events yet.";
+  events.forEach((ev, i) => {
+    const b = document.createElement("button"); b.className = "event";
+    const cover = ev.photos[0];
+    if (cover) { const im = document.createElement("img"); im.src = driveThumb(cover.id, 500); im.alt = ""; im.loading = "lazy"; b.appendChild(im); }
+    const cap = document.createElement("div"); cap.className = "cap";
+    const t = document.createElement("b"); t.textContent = ev.name;
+    const n = document.createElement("span"); n.textContent = ev.photos.length + (ev.photos.length === 1 ? " photo" : " photos");
+    cap.append(t, n); b.appendChild(cap);
+    b.onclick = () => openEvent(i);
+    box.appendChild(b);
+  });
+}
+
+function show(which) {
+  $("eventsView").classList.toggle("hidden", which !== "events");
+  $("uploadCard").classList.toggle("hidden", which !== "upload");
+  $("results").classList.toggle("hidden", which !== "results");
+  window.scrollTo(0, 0);
+}
+function resetSelfie() {
+  $("pickBtn").classList.remove("hidden");
+  $("selfiePreview").classList.add("hidden");
+  $("selfieInput").value = ""; setStatus("");
+}
+function openEvent(i) { current = events[i]; $("evName").textContent = current.name; resetSelfie(); show("upload"); }
+$("back").onclick = $("back2").onclick = () => { current = null; resetSelfie(); show("events"); };
+$("again").onclick = () => { resetSelfie(); show("upload"); };
+
+$("selfieInput").addEventListener("change", async e => {
+  const files = Array.from(e.target.files || []);
+  if (!files.length || !current) return;
+  $("pickBtn").classList.add("hidden");
+  try {
+    setStatus("Getting ready…");
+    await modelsReady;
+
+    setStatus("Looking at your selfie…");
+    const img = await fileToImage(files[0], 800);
+    $("selfiePreview").src = img.toDataURL("image/jpeg", .8);
+    $("selfiePreview").classList.remove("hidden");
+
+    const faces = await getDescriptors(img);
+    if (!faces.length) throw new Error("We couldn't see a face in that photo. Try a clear, front-facing selfie with good light.");
+    // If several faces, use the biggest (the person taking the selfie).
+    faces.sort((a, b) => b.box.width * b.box.height - a.box.width * a.box.height);
+    const me = faces[0].descriptor;
+
+    setStatus("Searching " + current.photos.length + " photos…");
+    const matches = [];
+    for (const p of current.photos) {
+      let best = Infinity;
+      for (const f of p.faces) { const d = euclid(me, f); if (d < best) best = d; }
+      if (best <= S.matchThreshold) matches.push({ p, d: best });
+    }
+    matches.sort((a, b) => a.d - b.d);
+    showResults(matches);
+    setStatus("");
+  } catch (err) {
+    setStatus(err.message || String(err), true);
+    $("pickBtn").classList.remove("hidden");
+  }
+});
+
+function showResults(matches) {
+  show("results");
+  $("count").textContent = matches.length
+    ? current.name + ": " + matches.length + " photo" + (matches.length === 1 ? "" : "s") + " of you"
+    : "No photos found in " + current.name;
+  const grid = $("grid"); grid.innerHTML = "";
+  if (!matches.length) {
+    grid.innerHTML = '<p class="small">Try a clearer selfie, or check you picked the right event.</p>';
+  }
+  for (const { p } of matches) {
+    const d = document.createElement("div"); d.className = "photo";
+    const im = document.createElement("img");
+    im.loading = "lazy"; im.src = driveThumb(p.id, 600); im.alt = "";
+    im.onclick = () => { $("lightbox").querySelector("img").src = driveThumb(p.id, 1800); $("lightbox").classList.add("on"); };
+    d.appendChild(im);
+    if (S.allowDownload) {
+      const a = document.createElement("a"); a.className = "dl"; a.href = driveDownload(p.id); a.textContent = "Download"; a.target = "_blank"; a.rel = "noopener";
+      d.appendChild(a);
+    }
+    grid.appendChild(d);
+  }
+  const c = $("contact"); c.innerHTML = "";
+  if (S.whatsapp) c.innerHTML += '<a class="btn" target="_blank" rel="noopener" href="https://wa.me/' + S.whatsapp + '">Message us on WhatsApp</a>';
+  if (S.instagram) c.innerHTML += '<a class="btn ghost" target="_blank" rel="noopener" href="https://instagram.com/' + S.instagram + '">Instagram</a>';
+}
+
+$("lightbox").onclick = () => $("lightbox").classList.remove("on");
+</script>
+</body>
+</html>

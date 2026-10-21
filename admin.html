@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Photographer setup</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .ev { display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line); font-family:system-ui,sans-serif; font-size:15px; }
+  .ev input { width:18px; height:18px; }
+  .ev .tag { margin-left:auto; font-size:12px; color:var(--muted); }
+  .ev label { display:flex; align-items:center; gap:10px; font-weight:500; flex:1; cursor:pointer; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Photographer setup</h1>
+    <p class="tagline">One master folder, one subfolder per event</p>
+  </header>
+
+  <section class="card wide">
+    <label for="folder">1. Master folder link (the folder that contains your event folders)</label>
+    <input id="folder" type="text" placeholder="https://drive.google.com/drive/folders/…">
+    <p class="small" style="margin-top:-8px">Share it as <b>“Anyone with the link → Viewer”</b>. Each subfolder's name becomes the event name clients see.</p>
+
+    <label for="key">2. Google API key</label>
+    <input id="key" type="password" placeholder="AIza…" autocomplete="off">
+    <p class="small" style="margin-top:-8px">See the setup guide (step 3). Saved only in this browser.</p>
+
+    <label for="old">3. Your previous index.json (optional — only when adding a new event)</label>
+    <input id="old" type="file" accept=".json,application/json" style="margin:4px 0 14px;font-size:14px">
+
+    <button class="btn" id="find">4. Find events</button>
+    <div id="status" class="status"></div>
+  </section>
+
+  <section class="card wide hidden" id="eventsCard">
+    <h2 style="margin-top:0;font-weight:400">Events found</h2>
+    <div id="eventList"></div>
+    <p class="small">Events already in your previous index are unticked, so only new ones get scanned. Tick one to rescan it (for example after adding more photos).</p>
+    <button class="btn" id="go">5. Scan selected events</button>
+    <div class="bar hidden" id="barWrap"><div id="bar"></div></div>
+    <div id="status2" class="status"></div>
+  </section>
+
+  <section class="card wide hidden" id="done">
+    <h2 style="margin-top:0;font-weight:400">Scan complete</h2>
+    <p id="summary"></p>
+    <button class="btn" id="download">Download index.json</button>
+    <p class="small">Put this file in your website folder next to <code>index.html</code>, replacing the old one, then publish again.</p>
+    <details id="skippedBox" class="small hidden"><summary>Photos that couldn't be scanned</summary><div id="skipped"></div></details>
+  </section>
+</div>
+
+<script src="config.js"></script>
+<script src="shared.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const store = { get: k => { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } },
+                set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} } };
+$("folder").value = store.get("fg_folder");
+$("key").value = store.get("fg_key");
+
+function setStatus(t, err, id) { const el = $(id || "status"); el.textContent = t || ""; el.className = "status" + (err ? " err" : ""); }
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function listFiles(q, key, fields) {
+  const out = [];
+  let pageToken = "";
+  do {
+    const url = "https://www.googleapis.com/drive/v3/files?q=" + encodeURIComponent(q) +
+      "&fields=" + encodeURIComponent("nextPageToken,files(" + fields + ")") +
+      "&pageSize=1000&supportsAllDrives=true&includeItemsFromAllDrives=true&key=" + encodeURIComponent(key) +
+      (pageToken ? "&pageToken=" + pageToken : "");
+    const r = await fetch(url);
+    const j = await r.json();
+    if (!r.ok) {
+      const msg = (j.error && j.error.message) || r.statusText;
+      throw new Error("Google Drive said: " + msg + ". Check the folder is shared with “Anyone with the link” and your API key is correct.");
+    }
+    out.push(...j.files);
+    pageToken = j.nextPageToken || "";
+  } while (pageToken);
+  return out;
+}
+
+// Load a Drive photo into a canvas: small thumbnail first (fast), then the full file.
+async function loadDriveImage(file, key) {
+  const attempts = [];
+  if (file.thumbnailLink) attempts.push(file.thumbnailLink.replace(/=s\d+$/, "=s1200"));
+  attempts.push("https://www.googleapis.com/drive/v3/files/" + file.id + "?alt=media&key=" + encodeURIComponent(key));
+  let lastErr;
+  for (const src of attempts) {
+    try {
+      const blob = await (await fetch(src)).blob();
+      if (!blob.type.startsWith("image/")) throw new Error("not an image");
+      return await fileToImage(blob, 1200);
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("could not download");
+}
+
+let oldIndex = null, events = [], key = "";
+
+// ---- Step: find events
+$("find").onclick = async () => {
+  const folderId = parseFolderId($("folder").value);
+  key = $("key").value.trim();
+  if (!folderId) return setStatus("That doesn't look like a Drive folder link.", true);
+  if (!key) return setStatus("Please paste your Google API key.", true);
+  store.set("fg_folder", $("folder").value); store.set("fg_key", key);
+  $("find").disabled = true; $("eventsCard").classList.add("hidden"); $("done").classList.add("hidden");
+  try {
+    oldIndex = null;
+    const f = $("old").files[0];
+    if (f) {
+      try { oldIndex = JSON.parse(await f.text()); } catch (e) { throw new Error("That index.json file couldn't be read."); }
+      if (oldIndex.photos && !oldIndex.events) oldIndex = { version: 2, events: [{ id: oldIndex.folderId, name: "Event", photos: oldIndex.photos }] };
+    }
+    setStatus("Reading your Drive folder…");
+    events = await listFiles("'" + folderId + "' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", key, "id,name,createdTime");
+    if (!events.length) throw new Error("No event folders found inside that folder. Create one subfolder per event inside the master folder.");
+    events.sort((a, b) => (b.createdTime || "").localeCompare(a.createdTime || ""));
+    const known = new Set(((oldIndex && oldIndex.events) || []).map(e => e.id));
+    $("eventList").innerHTML = events.map((e, i) =>
+      '<div class="ev"><label><input type="checkbox" data-i="' + i + '"' + (known.has(e.id) ? "" : " checked") + "> " + esc(e.name) + "</label>" +
+      '<span class="tag">' + (known.has(e.id) ? "already scanned" : "new") + "</span></div>").join("");
+    $("eventsCard").classList.remove("hidden");
+    setStatus(events.length + " event folder" + (events.length === 1 ? "" : "s") + " found.");
+  } catch (e) { setStatus(e.message || String(e), true); }
+  finally { $("find").disabled = false; }
+};
+
+// ---- Step: scan
+let result = null;
+$("go").onclick = async () => {
+  const chosen = Array.from(document.querySelectorAll("#eventList input:checked")).map(c => events[+c.dataset.i]);
+  if (!chosen.length) return setStatus("Tick at least one event to scan.", true, "status2");
+  $("go").disabled = true; $("done").classList.add("hidden");
+  $("barWrap").classList.remove("hidden"); $("bar").style.width = "0%";
+  const skipped = [];
+  try {
+    setStatus("Loading face recognition…", false, "status2");
+    await loadFaceModels(t => setStatus(t, false, "status2"));
+
+    // Gather photo lists for every chosen event first, so the progress bar covers everything.
+    const work = [];
+    for (const ev of chosen) {
+      setStatus("Listing photos in “" + ev.name + "”…", false, "status2");
+      const files = await listFiles("'" + ev.id + "' in parents and mimeType contains 'image/' and trashed = false", key, "id,name,thumbnailLink");
+      work.push({ ev, files });
+    }
+    const total = work.reduce((n, w) => n + w.files.length, 0);
+    if (!total) throw new Error("No photos found in the selected event folders.");
+
+    const scanned = {};
+    let done = 0, facesTotal = 0; const t0 = Date.now();
+    for (const { ev, files } of work) {
+      const photos = [];
+      for (const f of files) {
+        try {
+          const img = await loadDriveImage(f, key);
+          const found = await getDescriptors(img);
+          const faces = found.map(x => x.descriptor.map(n => Math.round(n * 1000) / 1000));
+          photos.push({ id: f.id, name: f.name, faces });
+          facesTotal += faces.length;
+        } catch (e) { skipped.push(ev.name + " / " + f.name + " (" + (e.message || e) + ")"); }
+        done++;
+        const left = Math.round((Date.now() - t0) / 1000 / done * (total - done));
+        $("bar").style.width = (done / total * 100) + "%";
+        setStatus("“" + ev.name + "” · " + done + " of " + total + " photos · about " + (left > 90 ? Math.round(left / 60) + " min" : left + " sec") + " left. Keep this tab open.", false, "status2");
+      }
+      scanned[ev.id] = { id: ev.id, name: ev.name, created: ev.createdTime || "", photos };
+    }
+
+    // Merge: events from this Drive listing (newest first), using fresh scans where we have them,
+    // otherwise the old index's data. Events removed from Drive disappear.
+    const oldById = {}; ((oldIndex && oldIndex.events) || []).forEach(e => { oldById[e.id] = e; });
+    const merged = [];
+    for (const ev of events) {
+      const e = scanned[ev.id] || oldById[ev.id];
+      if (e && e.photos.length) merged.push({ id: ev.id, name: ev.name, created: ev.createdTime || "", photos: e.photos });
+    }
+    result = { version: 2, created: new Date().toISOString(), events: merged };
+    const nPhotos = merged.reduce((n, e) => n + e.photos.length, 0);
+    $("summary").textContent = merged.length + " events, " + nPhotos + " photos in the index (" + facesTotal + " faces found this run)" +
+      (skipped.length ? "; " + skipped.length + " photo(s) skipped." : ".");
+    if (skipped.length) { $("skipped").innerHTML = skipped.map(s => "<div>" + esc(s) + "</div>").join(""); $("skippedBox").classList.remove("hidden"); }
+    $("done").classList.remove("hidden");
+    setStatus("", false, "status2");
+  } catch (e) { setStatus(e.message || String(e), true, "status2"); }
+  finally { $("go").disabled = false; }
+};
+
+$("download").onclick = () => {
+  const blob = new Blob([JSON.stringify(result)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "index.json"; a.click();
+};
+</script>
+</body>
+</html>
